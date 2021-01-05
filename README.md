@@ -2,8 +2,8 @@
 
 Introduction
 ------------
-Autonomous transcoder for Redacted and Orpheus
----
+Autonomous transcoder for Redacted or Orpheus
+--
 
 red_ops_better is a script which automatically transcodes and uploads these files to Redacted or Orpheus.
 
