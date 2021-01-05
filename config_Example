@@ -1,0 +1,31 @@
+[RED]
+username = YOur_username//LEAVE black if you are using Session Cookie of RED
+password = Your_Password//Leave blank if you are using Session Cookie of RED
+session_cookie = Working_Session_Cookie_for_Red
+data_dir = /download/directory/for/RED
+output_dir = /transcode/directory/for/RED
+torrent_dir = /watch/directory/for/RED
+formats = flac, v0, 320
+media = dat, cd, soundboard, web, sacd, vinyl, dvd, blu-ray
+24bit_behaviour = 0
+tracker = https://flacsfor.me/
+api = https://redacted.ch
+source = RED
+piece_length = 18
+
+[OPS]
+username = YOur_username//LEAVE black if you are using Session Cookie of OPS
+password = Your_Password//Leave blank if you are using Session Cookie of OPS
+session_cookie = Working_Session_Cookie_OF_OPS
+data_dir = /download/directory/for/OPS
+output_dir = /transcode/directory/for/OPS
+torrent_dir = /watch/directory/for/OPS
+formats = flac, v0
+media = sacd, vinyl, soundboard, web, blu-ray, dat, cd, dvd
+24bit_behaviour = 0
+tracker = https://home.opsfet.ch/
+api = https://orpheus.network
+source = OPS
+piece_length = 18
+
+

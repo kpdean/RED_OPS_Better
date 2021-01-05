@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+import configparser
+import argparse
+import pickle
+import os
+import shutil
+import sys
+import tempfile
+import traceback
+from urllib.parse import urlparse, parse_qsl
+from multiprocessing import cpu_count
+from getpass import getpass
+import tagged
+import transcode
+import RedOpsAPI
+
+import re
+import logging
+import base64
+from cryptography.fernet import Fernet
+import json
+from os.path import exists
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+
+
+if sys.version_info < (3, 6, 0):
+    raise Exception("Requires Python 3.6.0 or newer")
+
+def create_description(torrent, flac_dir, format, permalink):
+    # Create an example command to document the transcode process.
+    cmds = transcode.transcode_commands(format,
+                                        transcode.needs_resampling(flac_dir),
+                                        transcode.resample_rate(flac_dir),
+            'input.flac', 'output' + transcode.encoders[format]['ext'])
+
+    description = [
+        'Transcode process:',
+        '',
+        '[code]{0}[/code]'.format(' | '.join(cmds)),
+        '',
+        'Created using [url=https://github.com/kpdean/RED_OPS_Better]REDBetter (Chachhing fork)[/url]'
+        ''
+        ]
+    return description
+
+def formats_needed(group, torrent, supported_formats):
+    same_group = lambda t: t['media'] == torrent['media'] and\
+                           t['remasterYear'] == torrent['remasterYear'] and\
+                           t['remasterTitle'] == torrent['remasterTitle'] and\
+                           t['remasterRecordLabel'] == torrent['remasterRecordLabel'] and\
+                           t['remasterCatalogueNumber'] == torrent['remasterCatalogueNumber']
+
+    others = filter(same_group, group['torrents'])
+    current_formats = set((t['format'], t['encoding']) for t in others)
+    missing_formats = [format for format, details in [(f, RedOpsAPI.formats[f]) for f in supported_formats]\
+                           if (details['format'], details['encoding']) not in current_formats]
+    allowed_formats = RedOpsAPI.allowed_transcodes(torrent)
+    return [format for format in missing_formats if format in allowed_formats]
+
+def cred_file_encrypt_decryption(cipher, authFile, creds=None, encry_decry=None):
+    if encry_decry == 1:
+        with open(authFile, 'w') as outfile:
+            json.dump(creds, outfile, indent=2)
+        byte_string = json.dumps(creds).encode('utf-8') 
+        byte_ciphertext = cipher.encrypt(byte_string)    
+        with open(authFile_enc, "wb") as encrypt_file:
+            encrypt_file.write(byte_ciphertext)
+            encrp_str_dict = json.loads(byte_string)          
+            return encrp_str_dict
+    elif encry_decry == 0:
+        with open(authFile_enc, "rb") as decrypt_file:
+            data = decrypt_file.read()
+        decrypted_data = cipher.decrypt(data).decode('utf-8')
+        decrypted_data_dict = json.loads(decrypted_data)
+        return decrypted_data_dict
+
+def main():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, prog='red_ops_better')
+    parser.add_argument('release_urls', nargs='*', help='the URL where the release is located')
+    parser.add_argument('-s', '--single', action='store_true', help='only add one format per release (useful for getting unique groups)')
+    parser.add_argument('-j', '--threads', type=int, help='number of threads to use when transcoding',
+            default=max(cpu_count() - 1, 1))
+    parser.add_argument('--config', help='the location of the configuration file', \
+            default=os.path.expanduser(os.getcwd()+'/config'))
+    parser.add_argument('--cache', help='the location of the cache', \
+            default=os.path.expanduser(os.getcwd()+'/cache'))
+    parser.add_argument('-U', '--no-upload', action='store_true', help='don\'t upload new torrents (in case you want to do it manually)')
+    parser.add_argument('-E', '--no-24bit-edit', action='store_true', help='don\'t try to edit 24-bit torrents mistakenly labeled as 16-bit')
+    parser.add_argument('-S', '--skip', action='store_true', help="treats a torrent as already processed")
+    parser.add_argument('-t', '--totp', help="time based one time password for 2FA", default=None)
+    parser.add_argument('-T', '--tracker', help="pick your tracker for transcoding (choose from RED or OPS)", default='RED')
+
+    args = parser.parse_args()
+
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        open(args.config)
+        config.read(args.config)
+        dictConfig = config._sections
+        OrderedDict_dict = (dict(dictConfig))
+
+    except:
+        if not os.path.exists(os.path.dirname(args.config)) and not os.path.exists(authFile_enc):
+            os.makedirs(os.path.dirname(args.config))            
+        if not exists(authFile) and not exists(authFile_enc):        
+            config.add_section('RED')
+            config.set('RED', 'username', '')
+            config.set('RED', 'password', '')
+            config.set('RED', 'session_cookie', '')
+            config.set('RED', 'data_dir', '')
+            config.set('RED', 'output_dir', '')
+            config.set('RED', 'torrent_dir', '')
+            config.set('RED', 'formats', 'flac, V0, 320')
+            config.set('RED', 'media', ', '.join(RedOpsAPI.lossless_media))
+            config.set('RED', '24bit_behaviour','0')
+            config.set('RED', 'tracker', 'https://flacsfor.me/')
+            config.set('RED', 'api', 'https://redacted.ch')
+            config.set('RED', 'source', 'RED')
+            config.set('RED', 'piece_length', '18')
+            config.add_section('OPS')
+            config.set('OPS', 'username', '')
+            config.set('OPS', 'password', '')
+            config.set('OPS', 'data_dir', '')
+            config.set('OPS', 'output_dir', '')
+            config.set('OPS', 'torrent_dir', '')
+            config.set('OPS', 'formats', 'flac, V0, 320')
+            config.set('OPS', 'media', ', '.join(RedOpsAPI.lossless_media))
+            config.set('OPS', '24bit_behaviour','0')
+            config.set('OPS', 'tracker', 'https://home.opsfet.ch/')
+            config.set('OPS', 'api', 'https://orpheus.network')
+            config.set('OPS', 'source', 'OPS')
+            config.set('OPS', 'piece_length', '18')
+            config.write(open(args.config, 'w'))
+            print("Please edit the configuration file: {0}".format(args.config))
+            os._exit(0)
+    finally:
+        print("Password Must include Minimum length (10), Capital and lower letter, number and special character")
+        password_provided = getpass("Provide a Password for Encry and Decrp: ")  # This is input in the form of a string        
+        count = 0
+        while count < 1:
+            if(any(x.isupper() for x in password_provided) and any(x.islower() for x in password_provided) and any(x.isdigit() for x in password_provided) and len(password_provided) >= 10) and not set(password_provided).difference(printable):
+                password_provided = password_provided
+                count += 1
+            else:
+                print("Password Must include Minimum length (10), Capital and lower letter, number and special character.")
+                password_provided = getpass("Provide a Password for Encry and Decrp: ")                
+            
+        password = password_provided.encode()  # Convert to type bytes
+
+        #CHANGE THIS - Recommend--To Change os.urandom(16), must be of type bytes
+        #$python3.6 >>> import os >>> os.urandom(16) (Copy Output and Replace salt value)
+        salt = b'\xcfFI\xe8lgR\xdf!tt\xeeO\xc6\x12l\x13\xfa:\xf2\x13p\xfed\xca\x00\xfcb\xfe_`\xce=0\t\xbcRS[\xa7e)P\xeb\nrO&Z\x16\x9dvV;\x84q\x1d\xc7\x17Hq\x11\x8e\xca'  
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=1000000,
+            backend=default_backend()
+            )
+        key = base64.urlsafe_b64encode(kdf.derive(password)) 
+        cipher = Fernet(key)
+
+        if exists(authFile) and not exists(authFile_enc):
+            file_response = cred_file_encrypt_decryption(cipher, authFile, OrderedDict_dict, encry_decry=1)
+            if exists(authFile):
+                os.remove(authFile) 
+
+        elif exists(authFile_enc):
+            file_response = cred_file_encrypt_decryption(cipher, authFile_enc, encry_decry=0)
+            if exists(authFile):
+                os.remove(authFile)
+             
+        TrackerArgs = args.tracker.upper()
+        if TrackerArgs == 'RED':
+            config_dict = file_response['RED']
+            trackerLogingto = 'Redacted'
+        elif TrackerArgs == 'OPS':
+            config_dict = file_response['OPS']
+            trackerLogingto = 'Orpheus Network'
+        else:
+            print("Tracker argument must be (RED or OPS).")
+            sys.exit(2)
+
+        username = config_dict['username']
+        password = config_dict['password']
+
+        try:
+            session_cookie = os.path.expanduser(config_dict['session_cookie'])
+        except configparser.NoOptionError:
+            session_cookie = None
+        if not username and not password and not session_cookie:
+            if exists(authFile_enc):
+                os.remove(authFile_enc)
+            print('Configuration file requires Username and password or Session Cookie.')
+            sys.exit(2)            
+        do_24_bit = config_dict['24bit_behaviour']
+        data_dir = [os.path.expanduser(d) for d in config_dict['data_dir'].split(';')]
+        try:
+            output_dir = os.path.expanduser(config_dict['output_dir'])
+        except configparser.NoOptionError:
+            output_dir = None
+        if not output_dir:
+            output_dir = data_dir[0]
+        torrent_dir = os.path.expanduser(config_dict['torrent_dir'])
+        supported_formats = [format.strip().upper() for format in config_dict['formats'].split(',')]
+
+        try:
+            media_config = config_dict['media']
+            if not media_config:
+                supported_media = RedOpsAPI.lossless_media
+            else:
+                supported_media = set([medium.strip().lower() for medium in media_config.split(',')])
+                if not supported_media.issubset(set(RedOpsAPI.lossless_media)):
+                    print('Unsupported media type "{0}", edit your configuration'.format((supported_media - RedOpsAPI.lossless_media).pop()))
+                    print("Supported types are: {0}".format(', '.join(RedOpsAPI.lossless_media)))
+                    sys.exit(2)
+        except configparser.NoOptionError:
+            supported_media = RedOpsAPI.lossless_media
+
+        tracker = config_dict['tracker']
+        endpoint = config_dict['api']
+        source = config_dict['source']
+        piece_length = config_dict['piece_length']
+
+    upload_torrent = not args.no_upload
+
+    print("Logging in to " + trackerLogingto + "....")
+    api = RedOpsAPI.RED_OPS_API(username, password, session_cookie, endpoint, args.totp)
+
+    try:
+        seen = pickle.load(open(args.cache, 'rb'))
+    except:
+        seen = set()
+        pickle.dump(seen, open(args.cache, 'wb'))
+
+    if args.skip:
+        skip = [int(query['torrentid']) for query in\
+                [dict(parse_qsl(urlparse(url).query)) for url in args.release_urls]]
+        for id in skip:
+            print("Skipping torrent {0}".format(str(id)))
+            seen.add(str(id))
+        pickle.dump(seen, open(args.cache, 'wb'))
+        return
+
+    print("Searching for transcode candidates...")
+    if args.release_urls:
+        if len(args.release_urls) == 1 and os.path.isfile(args.release_urls[0]):
+            print("You supplied a url list, ignoring your configuration's media types.")
+            with open(args.release_urls[0]) as f:
+                candidates = [(int(query['id']), int(query['torrentid'])) for query in\
+                        [dict(parse_qsl(urlparse(url).query)) for url in f]]
+        else:
+            print("You supplied one or more release URLs, ignoring your configuration's media types.")
+            candidates = [(int(query['id']), int(query['torrentid'])) for query in\
+                    [dict(parse_qsl(urlparse(url).query)) for url in args.release_urls]]
+    else:
+        candidates = api.get_candidates(skip=seen, media=supported_media)
+
+    for groupid, torrentid in candidates:
+        group = api.request('torrentgroup', id=groupid)
+        if group != None:
+            torrent = [t for t in group['torrents'] if t['id'] == torrentid][0]
+
+            artist = "";
+            if len(group['group']['musicInfo']['artists']) > 1:
+                artist = "Various Artists"
+            elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']) > 1:
+                artist = "Various Artists"
+            elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']):
+                artist = group['group']['musicInfo']['composers'][0]['name']
+            else:
+                artist = group['group']['musicInfo']['artists'][0]['name']
+
+            year = str(torrent['remasterYear'])
+            if year == "0":
+                year = str(group['group']['year'])
+            media = str(torrent['media'])
+
+            releaseartist = "Release artist(s): {0}" .format(artist)
+            releasename   = "Release name     : {0}" .format(RedOpsAPI.unescape(group['group']['name']))
+            releaseyear   = "Release year     : {0}" .format(year)
+            releasemedia  = "Release Media    : {0}" .format(media)
+            releaseurl    = "Release URL      : {0}" .format(api.release_url(group, torrent))
+
+            print("\n\n")
+            print((releaseartist + "\n" + releasename + "\n" + releaseyear + "\n" + releasemedia + "\n" + releaseurl + "\n\n" ))
+
+        if not torrent['filePath']:
+            for d in data_dir:
+                flac_file = os.path.join(d, RedOpsAPI.unescape(torrent['fileList']).split('{{{')[0])
+                if not os.path.exists(flac_file):
+                    continue
+                flac_dir = os.path.join(d, "{0} ({1}) [FLAC]".format(
+                    RedOpsAPI.unescape(group['group']['name']), group['group']['year']))
+                if not os.path.exists(flac_dir):
+                    os.makedirs(flac_dir)
+                shutil.copy(flac_file, flac_dir)
+                break
+
+            if not os.path.exists(flac_file):
+                continue
+        else:
+            for d in data_dir:
+                flac_dir = os.path.join(d, RedOpsAPI.unescape(torrent['filePath']))
+                if os.path.exists(flac_dir):
+                    break
+
+        if int(do_24_bit):
+            try:
+                if transcode.is_24bit(flac_dir) and torrent['encoding'] != '24bit Lossless':
+                    # A lot of people are uploading FLACs from Bandcamp without realizing
+                    # that they're actually 24 bit files (usually 24/44.1). Since we know for
+                    # sure whether the files are 24 bit, we might as well correct the listing
+                    # on the site (and get an extra upload in the process).
+                    if args.no_24bit_edit:
+                        print("Release is actually 24-bit lossless, skipping.")
+                        continue
+                    if int(do_24_bit) == 1:  
+                        confirmation = raw_input("Mark release as 24bit lossless? y/n: ")
+                        if confirmation != 'y':
+                            continue
+                    print("Marking release as 24bit lossless.")
+                    api.set_24bit(torrent)
+                    group = api.request('torrentgroup', id=groupid)
+                    torrent = [t for t in group['torrents'] if t['id'] == torrentid][0]
+            except Exception as e:
+                print("Error: can't edit 24-bit torrent - skipping: {0}".format(e))
+                continue
+
+        if transcode.is_multichannel(flac_dir):
+            print("This is a multichannel release, which is unsupported - skipping")
+            continue
+
+        needed = formats_needed(group, torrent, supported_formats)
+        print("Formats needed: {0}".format(', '.join(needed)))
+
+        if needed:
+            # Before proceeding, do the basic tag checks on the source
+            # files to ensure any uploads won't be reported, but punt
+            # on the tracknumber formatting; problems with tracknumber
+            # may be fixable when the tags are copied.
+            broken_tags = False
+            for flac_file in transcode.locate(flac_dir, transcode.ext_matcher('.flac')):
+                (ok, msg) = tagged.check_tags(flac_file, check_tracknumber_format=False)
+                if not ok:
+                    print("A FLAC file in this release has unacceptable tags - skipping: {0}".format(msg))
+                    print("You might be able to trump it.")
+                    broken_tags = True
+                    break
+            if broken_tags:
+                continue
+
+            while os.path.exists(flac_dir) == False:
+                print("Path not found: {0}".format(flac_dir))
+                alternative_file_path_exists = ""
+                while (alternative_file_path_exists.lower() != "y") and (alternative_file_path_exists.lower() != "n"):
+                    alternative_file_path_exists = input("Do you wish to provide an alternative file path? (y/n): ")
+
+                if alternative_file_path_exists.lower() == "y":
+                    flac_dir = input("Alternative file path: ")
+                else:
+                    break
+
+            for format in needed:
+                if os.path.exists(flac_dir):
+                    print("Adding format {0}...".format(format), end=" ")
+                    tmpdir = tempfile.mkdtemp()
+                    AlbumName = RedOpsAPI.unescape(group['group']['name'])
+                    try:
+                        local_output_dir = config_dict['output_dir_{}'.format(format).lower()]
+                    except:
+                        local_output_dir = output_dir
+                    try:
+                        local_torrent_dir = config_dict['torrent_dir_{}'.format(format).lower()]
+                    except:
+                        local_torrent_dir = torrent_dir
+                    try:
+                        if len(torrent['remasterTitle']) >= 1:
+                            basename = artist + " - " + AlbumName + " (" + torrent['remasterTitle'] + ") " + "[" + year + "] (" + torrent['media'] + " - "
+                        else:
+                            basename = artist + " - " + AlbumName + " [" + year + "] (" + torrent['media'] + " - "
+                            
+                        transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, basename, format, max_threads=args.threads)
+                        if transcode_dir == False:
+                            print("Skipping - some file(s) in this release were incorrectly marked as 24bit.")
+                            break
+
+                        new_torrent = transcode.make_torrent(transcode_dir, tmpdir, tracker, api.passkey, piece_length, source)
+                        if upload_torrent:
+                            permalink = api.permalink(torrent)
+                            description = create_description(torrent, flac_dir, format, permalink)
+                            if TrackerArgs == 'OPS':
+                                api.uploadOPS(group, torrent, new_torrent, format, description)
+                            elif TrackerArgs == 'RED':
+                                api.uploadRED(group, torrent, new_torrent, format, description)                                
+                        shutil.copy(new_torrent, local_torrent_dir)
+                        print("done!")
+                        if args.single: break
+                    except Exception as e:
+                        print("Error adding format {0}: {1}".format(format, e))
+                        traceback.print_exc()
+                    finally:
+                        shutil.rmtree(tmpdir)
+                else:
+                    print("Path not found - skipping: {0}".format(flac_dir))
+                    break
+
+        seen.add(str(torrentid))
+        pickle.dump(seen, open(args.cache, 'wb'))
+
+if __name__ == "__main__":
+    authFile = "config" 
+    authFile_enc = "config.enc"
+    main()
