@@ -141,7 +141,7 @@ def main():
         password_provided = getpass("Provide a Password for Encry and Decrp: ")  # This is input in the form of a string        
         count = 0
         while count < 1:
-            if(any(x.isupper() for x in password_provided) and any(x.islower() for x in password_provided) and any(x.isdigit() for x in password_provided) and len(password_provided) >= 10) and not set(password_provided).difference(printable):
+            if(any(x.isupper() for x in password_provided) and any(x.islower() for x in password_provided) and any(x.isdigit() for x in password_provided) and len(password_provided) >= 10):
                 password_provided = password_provided
                 count += 1
             else:
