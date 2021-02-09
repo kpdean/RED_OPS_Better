@@ -263,12 +263,16 @@ def main():
         group = api.request('torrentgroup', id=groupid)
         if group != None:
             torrent = [t for t in group['torrents'] if t['id'] == torrentid][0]
-
+            
             artist = "";
-            if len(group['group']['musicInfo']['artists']) > 1:
+            if len(group['group']['musicInfo']['artists']) > 2:
                 artist = "Various Artists"
-            elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']) > 1:
+            elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']) > 2:
                 artist = "Various Artists"
+            elif len(group['group']['musicInfo']['artists']) == 2:
+                artist = group['group']['musicInfo']['artists'][0]['name'] + " & " + group['group']['musicInfo']['artists'][1]['name']                
+            elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']) == 2:
+                artist = group['group']['musicInfo']['composers'][0]['name'] + " & " + group['group']['musicInfo']['composers'][1]['name']         
             elif not group['group']['musicInfo']['artists'] and len(group['group']['musicInfo']['composers']):
                 artist = group['group']['musicInfo']['composers'][0]['name']
             else:
